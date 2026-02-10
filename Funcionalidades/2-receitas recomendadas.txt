@@ -1,0 +1,554 @@
+// ============================================================================
+// RecipeMatcher.ts - Módulo de Sugestão de Receitas Dinâmicas
+// NutriPoupa - Full Stack Developer
+// ============================================================================
+
+// ============================================================================
+// INTERFACES E TIPOS
+// ============================================================================
+
+interface UserProfile {
+  restrictions: {
+    vegan: boolean;
+    glutenFree: boolean;
+    lactoseFree?: boolean;
+    nutFree?: boolean;
+  };
+  macroTargets?: {
+    protein: number;    // gramas por dose
+    carbs: number;
+    fats: number;
+    calories: number;
+  };
+  servings: number;     // número de doses desejadas
+}
+
+interface PromoProduct {
+  id: string;
+  name: string;
+  category: string;
+  normalPrice: number;
+  promoPrice: number;
+  discount: number;      // percentagem
+  unit: string;          // 'kg', 'unidade', 'L', etc.
+  store: string;
+  validUntil: string;    // ISO date
+}
+
+interface PromoFeed {
+  weekStart: string;     // ISO date
+  weekEnd: string;
+  products: PromoProduct[];
+}
+
+interface Ingredient {
+  name: string;
+  quantity: number;
+  unit: string;
+  category: string;      // 'proteína', 'vegetal', 'cereal', etc.
+  optional?: boolean;
+}
+
+interface NutritionalInfo {
+  proteinPerServing: number;
+  carbsPerServing: number;
+  fatsPerServing: number;
+  caloriesPerServing: number;
+}
+
+interface Recipe {
+  id: string;
+  name: string;
+  description: string;
+  servings: number;
+  ingredients: Ingredient[];
+  tags: string[];        // ['vegan', 'gluten-free', 'high-protein', etc.]
+  nutritionalInfo: NutritionalInfo;
+  prepTime: number;      // minutos
+  difficulty: 'fácil' | 'média' | 'difícil';
+}
+
+interface RecipeDB {
+  recipes: Recipe[];
+}
+
+interface MatchedRecipe extends Recipe {
+  matchScore: number;           // 0-100
+  estimatedCost: number;        // custo total
+  costPerServing: number;       // custo por dose
+  matchedIngredients: string[]; // ingredientes encontrados em promo
+  savingsAmount: number;        // poupança total vs preço normal
+  nutritionalScore: number;     // quão próximo dos macros alvo
+}
+
+// ============================================================================
+// CONFIGURAÇÕES E CONSTANTES
+// ============================================================================
+
+const TAG_MAPPING = {
+  vegan: ['vegan', 'vegetarian', 'plant-based'],
+  glutenFree: ['gluten-free', 'sem glúten', 'celiac-friendly'],
+  lactoseFree: ['lactose-free', 'dairy-free', 'sem lactose'],
+  nutFree: ['nut-free', 'sem frutos secos']
+};
+
+// Pesos para cálculo de score de compatibilidade
+const SCORING_WEIGHTS = {
+  PROMO_MATCH: 0.4,        // 40% - ingredientes em promoção
+  NUTRITIONAL_FIT: 0.3,    // 30% - proximidade aos macros alvo
+  SAVINGS_AMOUNT: 0.2,     // 20% - valor absoluto de poupança
+  DIFFICULTY: 0.1          // 10% - preferência por receitas fáceis
+};
+
+// ============================================================================
+// CLASSE PRINCIPAL: RecipeMatcher
+// ============================================================================
+
+class RecipeMatcher {
+  private userProfile: UserProfile;
+  private promoFeed: PromoFeed;
+  private recipeDB: RecipeDB;
+  
+  // Cache de produtos normalizados para match eficiente
+  private promoProductsMap: Map<string, PromoProduct>;
+
+  constructor(
+    userProfile: UserProfile,
+    promoFeed: PromoFeed,
+    recipeDB: RecipeDB
+  ) {
+    this.userProfile = userProfile;
+    this.promoFeed = promoFeed;
+    this.recipeDB = recipeDB;
+    this.promoProductsMap = this.buildPromoMap();
+  }
+
+  // ========================================================================
+  // MÉTODO PRINCIPAL
+  // ========================================================================
+  
+  public getTopRecipes(topN: number = 5): MatchedRecipe[] {
+    console.log(`🔍 Iniciando análise de ${this.recipeDB.recipes.length} receitas...`);
+    
+    // STEP 1: Filtrar receitas por restrições alimentares
+    const compatibleRecipes = this.filterByRestrictions(this.recipeDB.recipes);
+    console.log(`✅ ${compatibleRecipes.length} receitas compatíveis com perfil`);
+    
+    // STEP 2: Calcular match com promoções e scores
+    const matchedRecipes = compatibleRecipes
+      .map(recipe => this.analyzeRecipe(recipe))
+      .filter(recipe => recipe.matchScore > 0); // Remove receitas sem match
+    
+    console.log(`💰 ${matchedRecipes.length} receitas têm ingredientes em promoção`);
+    
+    // STEP 3: Ordenar por score composto e retornar top N
+    const topRecipes = this.rankRecipes(matchedRecipes, topN);
+    
+    console.log(`🏆 Top ${topN} receitas selecionadas`);
+    return topRecipes;
+  }
+
+  // ========================================================================
+  // FILTROS DE RESTRIÇÕES ALIMENTARES
+  // ========================================================================
+  
+  private filterByRestrictions(recipes: Recipe[]): Recipe[] {
+    return recipes.filter(recipe => {
+      const { restrictions } = this.userProfile;
+      
+      // Verificar cada restrição ativa
+      if (restrictions.vegan && !this.hasAnyTag(recipe, TAG_MAPPING.vegan)) {
+        return false;
+      }
+      
+      if (restrictions.glutenFree && !this.hasAnyTag(recipe, TAG_MAPPING.glutenFree)) {
+        return false;
+      }
+      
+      if (restrictions.lactoseFree && !this.hasAnyTag(recipe, TAG_MAPPING.lactoseFree)) {
+        return false;
+      }
+      
+      if (restrictions.nutFree && !this.hasAnyTag(recipe, TAG_MAPPING.nutFree)) {
+        return false;
+      }
+      
+      return true;
+    });
+  }
+  
+  private hasAnyTag(recipe: Recipe, allowedTags: string[]): boolean {
+    return recipe.tags.some(tag => 
+      allowedTags.some(allowed => 
+        tag.toLowerCase().includes(allowed.toLowerCase())
+      )
+    );
+  }
+
+  // ========================================================================
+  // ANÁLISE E MATCHING DE RECEITAS
+  // ========================================================================
+  
+  private analyzeRecipe(recipe: Recipe): MatchedRecipe {
+    // Calcular custo e ingredientes em promoção
+    const { totalCost, normalCost, matchedIngredients } = this.calculateRecipeCost(recipe);
+    const costPerServing = totalCost / recipe.servings * this.userProfile.servings;
+    const savingsAmount = normalCost - totalCost;
+    
+    // Calcular scores individuais
+    const promoScore = this.calculatePromoMatchScore(recipe, matchedIngredients);
+    const nutritionalScore = this.calculateNutritionalScore(recipe);
+    const savingsScore = this.calculateSavingsScore(savingsAmount);
+    const difficultyScore = this.calculateDifficultyScore(recipe.difficulty);
+    
+    // Score composto ponderado
+    const matchScore = (
+      promoScore * SCORING_WEIGHTS.PROMO_MATCH +
+      nutritionalScore * SCORING_WEIGHTS.NUTRITIONAL_FIT +
+      savingsScore * SCORING_WEIGHTS.SAVINGS_AMOUNT +
+      difficultyScore * SCORING_WEIGHTS.DIFFICULTY
+    );
+
+    return {
+      ...recipe,
+      matchScore: Math.round(matchScore * 100) / 100,
+      estimatedCost: Math.round(totalCost * 100) / 100,
+      costPerServing: Math.round(costPerServing * 100) / 100,
+      matchedIngredients,
+      savingsAmount: Math.round(savingsAmount * 100) / 100,
+      nutritionalScore: Math.round(nutritionalScore * 100) / 100
+    };
+  }
+
+  // ========================================================================
+  // CÁLCULO DE CUSTOS
+  // ========================================================================
+  
+  private calculateRecipeCost(recipe: Recipe): {
+    totalCost: number;
+    normalCost: number;
+    matchedIngredients: string[];
+  } {
+    let totalCost = 0;
+    let normalCost = 0;
+    const matchedIngredients: string[] = [];
+
+    for (const ingredient of recipe.ingredients) {
+      const promoProduct = this.findBestPromoMatch(ingredient);
+      
+      if (promoProduct) {
+        // Ingrediente está em promoção
+        const cost = this.calculateIngredientCost(ingredient, promoProduct.promoPrice);
+        const normalPrice = this.calculateIngredientCost(ingredient, promoProduct.normalPrice);
+        
+        totalCost += cost;
+        normalCost += normalPrice;
+        matchedIngredients.push(ingredient.name);
+      } else {
+        // Ingrediente não está em promoção - estimar preço médio
+        const estimatedPrice = this.estimateIngredientPrice(ingredient);
+        totalCost += estimatedPrice;
+        normalCost += estimatedPrice;
+      }
+    }
+
+    return { totalCost, normalCost, matchedIngredients };
+  }
+  
+  private calculateIngredientCost(ingredient: Ingredient, pricePerUnit: number): number {
+    // Converter quantidade para unidade base do produto
+    const quantity = this.normalizeQuantity(ingredient.quantity, ingredient.unit);
+    return quantity * pricePerUnit;
+  }
+  
+  private estimateIngredientPrice(ingredient: Ingredient): number {
+    // Tabela de preços médios estimados por categoria (em €)
+    const avgPrices: Record<string, number> = {
+      'proteína': 8.0,
+      'vegetal': 2.5,
+      'cereal': 1.5,
+      'laticínio': 3.0,
+      'condimento': 2.0,
+      'default': 3.0
+    };
+    
+    const basePrice = avgPrices[ingredient.category] || avgPrices.default;
+    const quantity = this.normalizeQuantity(ingredient.quantity, ingredient.unit);
+    
+    return basePrice * quantity * 0.3; // Ajuste para porção
+  }
+  
+  private normalizeQuantity(quantity: number, unit: string): number {
+    // Normalizar para kg/L como base
+    const conversions: Record<string, number> = {
+      'g': 0.001,
+      'kg': 1,
+      'ml': 0.001,
+      'L': 1,
+      'unidade': 0.2, // Estimativa média
+      'colher': 0.015,
+      'chávena': 0.25
+    };
+    
+    return quantity * (conversions[unit] || 1);
+  }
+
+  // ========================================================================
+  // MATCHING DE INGREDIENTES COM PROMOÇÕES
+  // ========================================================================
+  
+  private buildPromoMap(): Map<string, PromoProduct> {
+    const map = new Map<string, PromoProduct>();
+    
+    for (const product of this.promoFeed.products) {
+      const normalizedName = this.normalizeProductName(product.name);
+      map.set(normalizedName, product);
+    }
+    
+    return map;
+  }
+  
+  private findBestPromoMatch(ingredient: Ingredient): PromoProduct | null {
+    const normalizedIngredient = this.normalizeProductName(ingredient.name);
+    
+    // Match exato
+    if (this.promoProductsMap.has(normalizedIngredient)) {
+      return this.promoProductsMap.get(normalizedIngredient)!;
+    }
+    
+    // Match parcial por palavras-chave
+    for (const [productName, product] of this.promoProductsMap.entries()) {
+      if (this.isFuzzyMatch(normalizedIngredient, productName)) {
+        return product;
+      }
+    }
+    
+    return null;
+  }
+  
+  private normalizeProductName(name: string): string {
+    return name
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '') // Remove acentos
+      .replace(/[^a-z0-9\s]/g, '')
+      .trim();
+  }
+  
+  private isFuzzyMatch(ingredient: string, product: string): boolean {
+    const ingredientWords = ingredient.split(/\s+/);
+    const productWords = product.split(/\s+/);
+    
+    // Verificar se alguma palavra-chave do ingrediente está no produto
+    return ingredientWords.some(word => 
+      word.length > 3 && productWords.some(pWord => 
+        pWord.includes(word) || word.includes(pWord)
+      )
+    );
+  }
+
+  // ========================================================================
+  // CÁLCULO DE SCORES
+  // ========================================================================
+  
+  private calculatePromoMatchScore(recipe: Recipe, matchedIngredients: string[]): number {
+    if (recipe.ingredients.length === 0) return 0;
+    
+    // Priorizar ingredientes principais (não opcionais)
+    const mainIngredients = recipe.ingredients.filter(ing => !ing.optional);
+    const matchedMainIngredients = matchedIngredients.filter(name =>
+      mainIngredients.some(ing => ing.name === name)
+    );
+    
+    const matchRatio = matchedMainIngredients.length / mainIngredients.length;
+    return matchRatio; // 0 a 1
+  }
+  
+  private calculateNutritionalScore(recipe: Recipe): number {
+    const { macroTargets } = this.userProfile;
+    
+    // Se não há targets definidos, retornar score neutro
+    if (!macroTargets) return 0.5;
+    
+    const { nutritionalInfo } = recipe;
+    
+    // Calcular desvio percentual para cada macro
+    const proteinDiff = Math.abs(nutritionalInfo.proteinPerServing - macroTargets.protein) / macroTargets.protein;
+    const carbsDiff = Math.abs(nutritionalInfo.carbsPerServing - macroTargets.carbs) / macroTargets.carbs;
+    const fatsDiff = Math.abs(nutritionalInfo.fatsPerServing - macroTargets.fats) / macroTargets.fats;
+    
+    // Média dos desvios (quanto menor, melhor)
+    const avgDiff = (proteinDiff + carbsDiff + fatsDiff) / 3;
+    
+    // Converter para score 0-1 (inverter, pois menor desvio = melhor score)
+    return Math.max(0, 1 - avgDiff);
+  }
+  
+  private calculateSavingsScore(savingsAmount: number): number {
+    // Normalizar poupança para escala 0-1
+    // Considerar €10 de poupança como score máximo
+    const maxSavings = 10;
+    return Math.min(1, savingsAmount / maxSavings);
+  }
+  
+  private calculateDifficultyScore(difficulty: Recipe['difficulty']): number {
+    const scores = {
+      'fácil': 1.0,
+      'média': 0.7,
+      'difícil': 0.4
+    };
+    
+    return scores[difficulty];
+  }
+
+  // ========================================================================
+  // RANKING E ORDENAÇÃO
+  // ========================================================================
+  
+  private rankRecipes(recipes: MatchedRecipe[], topN: number): MatchedRecipe[] {
+    return recipes
+      .sort((a, b) => {
+        // Ordenar por matchScore (descendente)
+        if (b.matchScore !== a.matchScore) {
+          return b.matchScore - a.matchScore;
+        }
+        
+        // Desempate: menor custo por dose
+        if (a.costPerServing !== b.costPerServing) {
+          return a.costPerServing - b.costPerServing;
+        }
+        
+        // Segundo desempate: maior poupança
+        return b.savingsAmount - a.savingsAmount;
+      })
+      .slice(0, topN);
+  }
+
+  // ========================================================================
+  // MÉTODOS AUXILIARES PÚBLICOS
+  // ========================================================================
+  
+  public getWeeklySummary(): {
+    totalRecipes: number;
+    compatibleRecipes: number;
+    recipesWithPromos: number;
+    avgSavings: number;
+  } {
+    const compatible = this.filterByRestrictions(this.recipeDB.recipes);
+    const withPromos = compatible.filter(recipe => {
+      const { matchedIngredients } = this.calculateRecipeCost(recipe);
+      return matchedIngredients.length > 0;
+    });
+    
+    const avgSavings = withPromos.reduce((sum, recipe) => {
+      const { totalCost, normalCost } = this.calculateRecipeCost(recipe);
+      return sum + (normalCost - totalCost);
+    }, 0) / (withPromos.length || 1);
+    
+    return {
+      totalRecipes: this.recipeDB.recipes.length,
+      compatibleRecipes: compatible.length,
+      recipesWithPromos: withPromos.length,
+      avgSavings: Math.round(avgSavings * 100) / 100
+    };
+  }
+}
+
+// ============================================================================
+// EXEMPLO DE USO
+// ============================================================================
+
+// Dados de exemplo
+const userProfile: UserProfile = {
+  restrictions: {
+    vegan: false,
+    glutenFree: true,
+    lactoseFree: false
+  },
+  macroTargets: {
+    protein: 30,
+    carbs: 50,
+    fats: 20,
+    calories: 500
+  },
+  servings: 4
+};
+
+const promoFeed: PromoFeed = {
+  weekStart: '2026-02-08',
+  weekEnd: '2026-02-14',
+  products: [
+    {
+      id: 'promo1',
+      name: 'Frango Peito',
+      category: 'proteína',
+      normalPrice: 6.99,
+      promoPrice: 4.99,
+      discount: 28.6,
+      unit: 'kg',
+      store: 'Continente',
+      validUntil: '2026-02-14'
+    },
+    {
+      id: 'promo2',
+      name: 'Brócolos',
+      category: 'vegetal',
+      normalPrice: 2.49,
+      promoPrice: 1.49,
+      discount: 40.2,
+      unit: 'kg',
+      store: 'Pingo Doce',
+      validUntil: '2026-02-14'
+    }
+  ]
+};
+
+const recipeDB: RecipeDB = {
+  recipes: [
+    {
+      id: 'rec1',
+      name: 'Frango Grelhado com Brócolos',
+      description: 'Prato saudável e rico em proteína',
+      servings: 4,
+      ingredients: [
+        { name: 'frango peito', quantity: 600, unit: 'g', category: 'proteína' },
+        { name: 'brócolos', quantity: 400, unit: 'g', category: 'vegetal' },
+        { name: 'azeite', quantity: 2, unit: 'colher', category: 'condimento' }
+      ],
+      tags: ['gluten-free', 'high-protein', 'low-carb'],
+      nutritionalInfo: {
+        proteinPerServing: 35,
+        carbsPerServing: 12,
+        fatsPerServing: 8,
+        caloriesPerServing: 280
+      },
+      prepTime: 25,
+      difficulty: 'fácil'
+    }
+  ]
+};
+
+// Executar
+const matcher = new RecipeMatcher(userProfile, promoFeed, recipeDB);
+const topRecipes = matcher.getTopRecipes(5);
+
+console.log('\n📊 TOP 5 EMENTAS DA SEMANA:');
+console.log('='.repeat(80));
+
+topRecipes.forEach((recipe, index) => {
+  console.log(`\n${index + 1}. ${recipe.name}`);
+  console.log(`   💯 Score: ${recipe.matchScore}/100`);
+  console.log(`   💰 Custo/Dose: €${recipe.costPerServing}`);
+  console.log(`   💸 Poupança: €${recipe.savingsAmount}`);
+  console.log(`   🛒 Ingredientes em Promo: ${recipe.matchedIngredients.join(', ')}`);
+  console.log(`   ⏱️  Tempo: ${recipe.prepTime}min | Dificuldade: ${recipe.difficulty}`);
+});
+
+const summary = matcher.getWeeklySummary();
+console.log('\n📈 RESUMO SEMANAL:');
+console.log(`   Total de receitas: ${summary.totalRecipes}`);
+console.log(`   Compatíveis com perfil: ${summary.compatibleRecipes}`);
+console.log(`   Com ingredientes em promoção: ${summary.recipesWithPromos}`);
+console.log(`   Poupança média: €${summary.avgSavings}`);
+
+export { RecipeMatcher, UserProfile, PromoFeed, RecipeDB, MatchedRecipe };
